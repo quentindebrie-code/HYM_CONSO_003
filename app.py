@@ -423,6 +423,59 @@ def site_mois(res: Resultat) -> pd.DataFrame:
     p["Total"] = p.sum(axis=1)
     return p
 
+
+def prix_moyen_periode(res: Resultat, granularite: str = "Mois",
+                       debut=None, fin=None, produits=None) -> pd.DataFrame:
+    """Évolution du prix moyen pondéré sur une période.
+
+    Le prix moyen d'une période n'est pas la moyenne des prix unitaires : c'est le
+    montant total divisé par le volume total, sinon une petite livraison chère pèse
+    autant qu'un plein camion. Les avoirs et refacturations sont inclus, puisqu'ils
+    corrigent précisément le prix facturé.
+    """
+    d = res.donnees
+    if "Montant" not in d.columns:
+        return pd.DataFrame()
+    d = d[d["Date"].notna()].copy()
+    if debut is not None:
+        d = d[d["Date"] >= pd.Timestamp(debut)]
+    if fin is not None:
+        d = d[d["Date"] <= pd.Timestamp(fin)]
+    if produits:
+        d = d[d["Produit"].isin(produits)]
+    if d.empty:
+        return pd.DataFrame()
+
+    code = {"Mois": "M", "Semaine": "W", "Trimestre": "Q"}[granularite]
+    freq = {"Mois": "MS", "Semaine": "W-MON", "Trimestre": "QS"}[granularite]
+    d["Periode"] = d["Date"].dt.to_period(code).dt.start_time
+
+    t = (d.groupby("Periode")
+           .agg(Volume=("Quantite", "sum"), Montant=("Montant", "sum"),
+                Livraisons=("Cpt_BL", "sum")))
+    index = pd.date_range(t.index.min(), t.index.max(), freq=freq)
+    t = t.reindex(index, fill_value=0)
+    t.index.name = "Periode"
+    t["Prix moyen"] = (t["Montant"] / t["Volume"] * 1000).where(t["Volume"] != 0)
+    return t
+
+
+def bornes_periode(ts, granularite: str):
+    """Renvoie (premier jour, dernier jour) de la période commençant à ts."""
+    code = {"Mois": "M", "Semaine": "W", "Trimestre": "Q"}[granularite]
+    p = pd.Timestamp(ts).to_period(code)
+    return p.start_time.date(), p.end_time.date()
+
+
+def libelle_periode(ts, granularite: str) -> str:
+    """Étiquette courte d'une période, adaptée à la granularité."""
+    ts = pd.Timestamp(ts)
+    if granularite == "Mois":
+        return MOIS[ts.month - 1][:3] + " " + str(ts.year)[2:]
+    if granularite == "Trimestre":
+        return f"T{(ts.month - 1) // 3 + 1} {str(ts.year)[2:]}"
+    return ts.strftime("%d/%m/%y")
+
 # ============================================================================
 # EXPORT EXCEL
 # ============================================================================
@@ -431,6 +484,7 @@ import io
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
 
 
@@ -495,7 +549,8 @@ def _xl_habiller(ws, r0, rt, ncol):
 
 
 def construire_classeur(res: Resultat, client: str, periode: str, unite: str = "L",
-               libelle_montant: str = "Montant") -> bytes:
+               libelle_montant: str = "Montant",
+               prix_options: dict | None = None) -> bytes:
     d = res.donnees
     produits = res.produits
     sites = sorted(res.sites)
@@ -727,6 +782,93 @@ def construire_classeur(res: Resultat, client: str, periode: str, unite: str = "
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
 
+    # ------------------------------------------ 3 bis. Évolution du prix moyen
+    if argent and prix_options and prix_options.get("actif"):
+        gr = prix_options.get("granularite", "Mois")
+        filtre = prix_options.get("produits") or []
+        tpx = prix_moyen_periode(res, gr, prix_options.get("debut"),
+                                          prix_options.get("fin"), filtre)
+        if len(tpx) >= 2:
+            ws = wb.create_sheet("Évolution du prix moyen")
+            _xl_base(ws)
+            perim = ", ".join(filtre) if filtre else "tous produits confondus"
+            _xl_titre(ws, "Évolution du prix moyen",
+                   f"{entete}  |  Granularité : {gr.lower()}  |  {perim}")
+            _xl_entetes(ws, 5, ["Période", "Du", "Au", f"Volume\n({unite})",
+                             f"{libelle_montant}\n(€)", "Prix moyen\n(€/1000 L)",
+                             "Nb de\nlivraisons", "Écart vs\nmoyenne"],
+                     [16, 12, 12, 15, 16, 16, 12, 13])
+
+            def _somme(colonne, ligne):
+                """SUMIFS bornée en date, additionnée produit par produit si filtre."""
+                base = (f'SUMIFS({XL_D}!${colonne}:${colonne},'
+                        f'{XL_D}!$A:$A,">="&$B{ligne},{XL_D}!$A:$A,"<="&$C{ligne}')
+                if not filtre:
+                    return "=" + base + ")"
+                return "=" + "+".join(
+                    base + f',{XL_D}!${COL_PROD}:${COL_PROD},$J${6 + i})'
+                    for i in range(len(filtre)))
+
+            # Colonne technique J : libellés des produits filtrés, servant de critère.
+            for i, p in enumerate(filtre):
+                c = ws.cell(row=6 + i, column=10, value=p)
+                c.font = Font(name=FONT, size=1, color=XL_BLANC)
+            ws.column_dimensions["J"].width = 2
+
+            r0 = 6
+            for i, (ts, row) in enumerate(tpx.iterrows()):
+                rr = r0 + i
+                d1, d2 = bornes_periode(ts, gr)
+                ws.cell(row=rr, column=1, value=libelle_periode(ts, gr))
+                ws.cell(row=rr, column=2, value=d1).number_format = "DD/MM/YYYY"
+                ws.cell(row=rr, column=3, value=d2).number_format = "DD/MM/YYYY"
+                ws.cell(row=rr, column=4, value=_somme(COL_QTE, rr))
+                ws.cell(row=rr, column=5, value=_somme(COL_MNT, rr))
+                ws.cell(row=rr, column=6, value=f'=IFERROR($E{rr}/$D{rr}*1000,"")')
+                ws.cell(row=rr, column=7, value=_somme(COL_CPT, rr))
+                ws.cell(row=rr, column=8,
+                        value=f'=IFERROR($F{rr}/$F${r0 + len(tpx)}-1,"")')
+            rt = r0 + len(tpx)
+            ws.cell(row=rt, column=1, value="MOYENNE PONDÉRÉE")
+            for col in (4, 5, 7):
+                L = get_column_letter(col)
+                ws.cell(row=rt, column=col, value=f"=SUM({L}{r0}:{L}{rt - 1})")
+            ws.cell(row=rt, column=6, value=f'=IFERROR($E{rt}/$D{rt}*1000,"")')
+            ws.cell(row=rt, column=8, value=0)
+            _xl_habiller(ws, r0, rt, 8)
+            for rr in range(r0, rt + 1):
+                ws.cell(row=rr, column=1).alignment = Alignment(horizontal="center")
+                ws.cell(row=rr, column=4).number_format = FMT_L
+                ws.cell(row=rr, column=5).number_format = FMT_EUR
+                ws.cell(row=rr, column=6).number_format = FMT_DEC
+                ws.cell(row=rr, column=7).number_format = FMT_NB
+                ws.cell(row=rr, column=8).number_format = '+0.0%;-0.0%;0.0%'
+
+            graphe = LineChart()
+            graphe.title = "Prix moyen pondéré (€/1000 L)"
+            graphe.height, graphe.width = 8.5, 20
+            graphe.y_axis.title = "€ / 1000 L"
+            graphe.legend = None
+            donnees = Reference(ws, min_col=6, min_row=5, max_row=rt - 1)
+            cats = Reference(ws, min_col=1, min_row=r0, max_row=rt - 1)
+            graphe.add_data(donnees, titles_from_data=True)
+            graphe.set_categories(cats)
+            serie = graphe.series[0]
+            serie.graphicalProperties.line.solidFill = XL_VERT
+            serie.graphicalProperties.line.width = 28000
+            serie.smooth = False
+            ws.add_chart(graphe, "L5")
+
+            ws.cell(row=rt + 2, column=1,
+                    value="Prix moyen pondéré par les volumes : montant total divisé par "
+                          "volume total. Une moyenne simple des prix unitaires donnerait "
+                          "un résultat faussé par les petites livraisons.")
+            ws.cell(row=rt + 2, column=1).font = Font(
+                name=FONT, size=8, italic=True, color="6B7280")
+            ws.freeze_panes = "A6"
+            ws.print_title_rows = "5:5"
+            ws.page_setup.orientation = "landscape"
+
     # ------------------------------------------------ 4. Détail des livraisons
     ws = wb.create_sheet("Détail des livraisons")
     _xl_base(ws)
@@ -949,8 +1091,87 @@ def _pdf_svg_produits(tp, produits, coul) -> str:
             + "".join(segs) + "</svg>")
 
 
+def _pdf_svg_prix(t, granularite: str) -> str:
+    """Courbe du prix moyen pondéré, avec bande de volume en arrière-plan."""
+    import pandas as pd
+    W, H = 700, 240
+    ML, MR, MT, MB = 54, 24, 18, 34
+    pts = t[t["Prix moyen"].notna()]
+    if len(pts) < 2:
+        return ""
+
+    vals = pts["Prix moyen"].tolist()
+    lo, hi = min(vals), max(vals)
+    marge = (hi - lo) * 0.18 or (hi * 0.05 or 1)
+    lo, hi = lo - marge, hi + marge
+    n = len(t)
+    pas = (W - ML - MR) / max(n - 1, 1)
+    vmax = t["Volume"].max() or 1
+
+    def x(i):
+        return ML + i * pas
+
+    def y(v):
+        return MT + (hi - v) / (hi - lo) * (H - MT - MB)
+
+    out = []
+    for k in range(5):
+        v = lo + (hi - lo) * k / 4
+        yy = y(v)
+        out.append(f'<line x1="{ML}" y1="{yy:.1f}" x2="{W - MR}" y2="{yy:.1f}" '
+                   f'stroke="#EDF1EF" stroke-width="1"/>')
+        out.append(f'<text x="{ML - 7}" y="{yy + 3:.1f}" text-anchor="end" '
+                   f'font-size="7.5" fill="#9AA0A6">{_pdf_n(v, 0)} €</text>')
+
+    largeur = min(pas * 0.5, 22)
+    for i, (_, r) in enumerate(t.iterrows()):
+        h = (r["Volume"] / vmax) * (H - MT - MB) * 0.32
+        if h > 0:
+            out.append(f'<rect x="{x(i) - largeur / 2:.1f}" y="{H - MB - h:.1f}" '
+                       f'width="{largeur:.1f}" height="{h:.1f}" fill="#E8F5EF"/>')
+
+    coords = [(x(i), y(v)) for i, v in enumerate(t["Prix moyen"]) if pd.notna(v)]
+    trace = " ".join(f"{'M' if k == 0 else 'L'}{cx:.1f},{cy:.1f}"
+                     for k, (cx, cy) in enumerate(coords))
+    out.append(f'<path d="{trace}" fill="none" stroke="{PDF_VERT}" '
+               f'stroke-width="2.2" stroke-linejoin="round"/>')
+
+    tv = t["Volume"].sum()
+    moy = t["Montant"].sum() / tv * 1000 if tv else 0
+    if lo < moy < hi:
+        ym = y(moy)
+        out.append(f'<line x1="{ML}" y1="{ym:.1f}" x2="{W - MR}" y2="{ym:.1f}" '
+                   f'stroke="{PDF_FONCE}" stroke-width="1" stroke-dasharray="4,3"/>')
+        out.append(f'<text x="{W - MR}" y="{ym - 5:.1f}" text-anchor="end" '
+                   f'font-size="7.5" fill="{PDF_FONCE}" font-weight="600">'
+                   f'moyenne {_pdf_n(moy, 0)} €</text>')
+
+    # Étiquettes d'abscisse : une sur `saut`, plus la dernière si elle ne
+    # chevauche pas la précédente.
+    saut = max(1, n // 12)
+    reperes = list(range(0, n, saut))
+    if n - 1 - reperes[-1] >= saut * 0.7:
+        reperes.append(n - 1)
+    else:
+        reperes[-1] = n - 1
+    for i, (ts, r) in enumerate(t.iterrows()):
+        if pd.notna(r["Prix moyen"]):
+            out.append(f'<circle cx="{x(i):.1f}" cy="{y(r["Prix moyen"]):.1f}" '
+                       f'r="2.6" fill="#fff" stroke="{PDF_VERT}" stroke-width="1.8"/>')
+        if i in reperes:
+            out.append(f'<text x="{x(i):.1f}" y="{H - 12}" text-anchor="middle" '
+                       f'font-size="7.5" fill="#6B7280">'
+                       f'{libelle_periode(ts, granularite)}</text>')
+
+    out.append(f'<line x1="{ML}" y1="{H - MB}" x2="{W - MR}" y2="{H - MB}" '
+               f'stroke="#D0D4D2"/>')
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" font-family="Poppins">'
+            + "".join(out) + "</svg>")
+
+
 def construire_rapport(res: Resultat, client: str, periode: str, unite: str = "L",
-               libelle_montant: str = "Montant") -> bytes:
+               libelle_montant: str = "Montant",
+               prix_options: dict | None = None) -> bytes:
     d = res.donnees
     produits = res.produits
     argent = "Montant" in d.columns
@@ -1033,6 +1254,36 @@ Volume mensuel moyen : {_pdf_n(tm.mean())} {unite}.
 Mois le plus fort : {MOIS_L[i_max]} ({_pdf_n(tm.iloc[i_max])} {unite}) ;
 mois le plus faible : {MOIS_L[i_min]} ({_pdf_n(tm.iloc[i_min])} {unite}).</div>"""
 
+    # ------------------------------------------------- évolution du prix moyen
+    bloc_prix = ""
+    if argent and prix_options and prix_options.get("actif"):
+        gr = prix_options.get("granularite", "Mois")
+        tpx = prix_moyen_periode(res, gr, prix_options.get("debut"),
+                                          prix_options.get("fin"),
+                                          prix_options.get("produits"))
+        svg = _pdf_svg_prix(tpx, gr) if len(tpx) else ""
+        if svg:
+            valides = tpx[tpx["Prix moyen"].notna()]
+            i_hi = valides["Prix moyen"].idxmax()
+            i_lo = valides["Prix moyen"].idxmin()
+            moy = tpx["Montant"].sum() / tpx["Volume"].sum() * 1000
+            ampl = (valides["Prix moyen"].max() - valides["Prix moyen"].min()) / moy * 100
+            filtre = prix_options.get("produits")
+            perim = (", ".join(_pdf_e(p) for p in filtre) if filtre
+                     else "tous produits confondus")
+            bloc_prix = f"""
+<div class="brk"></div>
+<h2>Évolution du prix moyen</h2>
+{svg}
+<div class="note">Prix moyen pondéré par les volumes, en euros pour 1 000 {_pdf_e(unite)},
+{perim}. Les barres claires rappellent le volume livré sur chaque période.
+Moyenne de la période : {_pdf_n(moy, 2)} €.
+Point haut : {libelle_periode(i_hi, gr)}
+({_pdf_n(valides.loc[i_hi, 'Prix moyen'], 2)} €) ;
+point bas : {libelle_periode(i_lo, gr)}
+({_pdf_n(valides.loc[i_lo, 'Prix moyen'], 2)} €), soit une amplitude de
+{_pdf_n(ampl, 1)} % de la moyenne.</div>"""
+
     # ------------------------------------------------------- méthodologie
     meth = [
         ("Objet", f"État des consommations par site de livraison pour le client {_pdf_e(client)}, "
@@ -1100,6 +1351,7 @@ mois le plus faible : {MOIS_L[i_min]} ({_pdf_n(tm.iloc[i_min])} {unite}).</div>"
 </table>
 <div class="note">Sites classés par volume total décroissant. Volumes nets des avoirs et
 régularisations de la période.</div>
+{bloc_prix}
 
 <div class="brk"></div>
 <h2>Méthodologie et périmètre</h2>
@@ -1297,6 +1549,7 @@ renommage = {str(r["Libellé source"]): str(r["Libellé retenu"]).strip()
 
 # --- Valorisation (désactivée par défaut)
 col_prix, diviseur, libelle_montant = None, 1.0, "Montant"
+prix_options = {"actif": False}
 cands = mapping["prix_candidats"]
 with st.expander("Valorisation financière (optionnelle)"):
     if not cands:
@@ -1311,7 +1564,7 @@ with st.expander("Valorisation financière (optionnelle)"):
             with p1:
                 col_prix = st.selectbox("Colonne de prix", cands)
             with p2:
-                base = st.radio("Base de la colonne", ["HT", "TTC (TVA 20 %)"], horizontal=False)
+                base = st.radio("Base de la colonne", ["HT", "TTC (TVA 20 %)"])
                 diviseur = 1.2 if base.startswith("TTC") else 1.0
             with p3:
                 libelle_montant = st.text_input("Intitulé de la colonne montant",
@@ -1319,6 +1572,38 @@ with st.expander("Valorisation financière (optionnelle)"):
             st.caption("Les prix sont interprétés en euros pour 1 000 unités. "
                        "Vérifiez qu'aucune colonne de coût d'achat interne n'est diffusée "
                        "au client.")
+
+            st.divider()
+            prix_options["actif"] = st.checkbox(
+                "Ajouter la courbe d'évolution du prix moyen", value=True,
+                help="Une page supplémentaire dans le PDF et un onglet dans le classeur.")
+            if prix_options["actif"]:
+                q1, q2 = st.columns([1, 2])
+                with q1:
+                    prix_options["granularite"] = st.radio(
+                        "Granularité", ["Mois", "Trimestre", "Semaine"], index=0)
+                    tout = st.checkbox("Toute la période du document", value=True)
+                with q2:
+                    d0, d1 = res0.stats["date_min"], res0.stats["date_max"]
+                    if tout or pd.isna(d0):
+                        prix_options["debut"] = prix_options["fin"] = None
+                        if pd.notna(d0):
+                            st.caption(f"Période retenue : du {d0.strftime('%d/%m/%Y')} "
+                                       f"au {d1.strftime('%d/%m/%Y')}.")
+                    else:
+                        bornes = st.date_input(
+                            "Période analysée", value=(d0.date(), d1.date()),
+                            min_value=d0.date(), max_value=d1.date())
+                        if isinstance(bornes, (tuple, list)) and len(bornes) == 2:
+                            prix_options["debut"], prix_options["fin"] = bornes
+                        else:
+                            prix_options["debut"] = prix_options["fin"] = None
+                    prix_options["produits"] = st.multiselect(
+                        "Produits analysés",
+                        [renommage.get(p, p) for p in res0.produits], default=[],
+                        help="Vide = tous les produits. Restreindre à un seul produit "
+                             "donne une courbe lisible ; mélanger plusieurs énergies fait "
+                             "surtout apparaître un effet de mix, pas un effet prix.")
 
 res = preparer(df_source, mapping, retenues, regroupement, renommage,
                        col_prix, diviseur)
@@ -1352,7 +1637,7 @@ k[4].metric("Montant" if "montant" in s else "Produits",
             f"{s['montant']:,.0f} €".replace(",", "\u202f") if "montant" in s
             else s["nb_produits"])
 
-t1, t2, t3 = st.tabs(["Par site", "Par produit", "Par mois"])
+t1, t2, t3, t4 = st.tabs(["Par site", "Par produit", "Par mois", "Prix moyen"])
 with t1:
     tsite = par_site(res)
     fmt = {c: "{:,.0f}" for c in tsite.columns if c != "Part"}
@@ -1367,6 +1652,31 @@ with t3:
         st.bar_chart(tm, color=VERT, height=280)
     else:
         st.caption("Aucune date exploitable : la vue mensuelle est désactivée.")
+with t4:
+    if not prix_options.get("actif"):
+        st.caption("Activez la valorisation financière et la courbe de prix dans les "
+                   "paramètres pour afficher cette vue.")
+    else:
+        tpx = prix_moyen_periode(
+            res, prix_options.get("granularite", "Mois"), prix_options.get("debut"),
+            prix_options.get("fin"), prix_options.get("produits"))
+        if tpx.empty or tpx["Prix moyen"].notna().sum() < 2:
+            st.warning("Pas assez de périodes valorisées pour tracer une courbe.")
+        else:
+            vals = tpx["Prix moyen"].dropna()
+            moy = tpx["Montant"].sum() / tpx["Volume"].sum() * 1000
+            c = st.columns(4)
+            c[0].metric("Prix moyen pondéré", f"{moy:,.2f} €".replace(",", "\u202f"))
+            c[1].metric("Point haut", f"{vals.max():,.2f} €".replace(",", "\u202f"))
+            c[2].metric("Point bas", f"{vals.min():,.2f} €".replace(",", "\u202f"))
+            c[3].metric("Amplitude", f"{(vals.max() - vals.min()) / moy * 100:.1f} %")
+            courbe = tpx["Prix moyen"].copy()
+            courbe.index = [libelle_periode(i, prix_options["granularite"])
+                            for i in courbe.index]
+            st.line_chart(courbe, color=VERT, height=300)
+            st.caption("Prix moyen pondéré par les volumes, en euros pour 1 000 "
+                       f"{unite}. Une moyenne simple des prix unitaires donnerait un "
+                       "résultat faussé par les petites livraisons.")
 
 # =====================================================================
 # 7. Génération
@@ -1379,8 +1689,10 @@ if not client.strip():
 if st.button("Générer le PDF et le classeur Excel", type="primary"):
     with st.spinner("Génération en cours…"):
         try:
-            pdf = construire_rapport(res, client.strip(), periode, unite, libelle_montant)
-            xls = construire_classeur(res, client.strip(), periode, unite, libelle_montant)
+            pdf = construire_rapport(res, client.strip(), periode, unite,
+                                        libelle_montant, prix_options)
+            xls = construire_classeur(res, client.strip(), periode, unite,
+                                          libelle_montant, prix_options)
         except Exception as exc:
             st.error(f"Échec de la génération : {exc}")
             st.stop()
