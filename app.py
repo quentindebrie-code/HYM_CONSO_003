@@ -198,6 +198,8 @@ def preparer(
     renommage_produits: dict[str, str] | None = None,
     col_prix: str | None = None,
     diviseur_prix: float = 1.0,
+    debut=None,
+    fin=None,
 ) -> Resultat:
     """Construit le jeu de données propre servant de base à tous les livrables."""
     c_date, c_bl = mapping.get("date"), mapping.get("bl")
@@ -218,6 +220,23 @@ def preparer(
     retenues = set(str(x).strip() for x in designations_retenues)
     d = d[d["Produit_source"].isin(retenues)].copy()
     lignes_exclues = total_lignes - len(d)
+
+    # --- Filtre de période : il s'applique à TOUT le rapport, pas seulement aux
+    # vues temporelles. Les lignes sans date exploitable sont écartées dès qu'un
+    # filtre est actif, faute de pouvoir les situer.
+    lignes_hors_periode = 0
+    lignes_sans_date = 0
+    if debut is not None or fin is not None:
+        avant = len(d)
+        garde = d["Date"].notna()
+        lignes_sans_date = int((~garde).sum())
+        if debut is not None:
+            garde &= d["Date"] >= pd.Timestamp(debut)
+        if fin is not None:
+            garde &= d["Date"] <= pd.Timestamp(fin) + pd.Timedelta(days=1) \
+                     - pd.Timedelta(seconds=1)
+        d = d[garde].copy()
+        lignes_hors_periode = avant - len(d)
 
     # --- Typologie des pièces
     d["Type"] = "Livraison"
@@ -263,6 +282,10 @@ def preparer(
     stats = {
         "lignes_source": total_lignes,
         "lignes_exclues": lignes_exclues,
+        "lignes_hors_periode": lignes_hors_periode,
+        "lignes_sans_date": lignes_sans_date,
+        "filtre_debut": debut,
+        "filtre_fin": fin,
         "lignes_retenues": len(d),
         "lignes_livraison": int((d.Type == "Livraison").sum()),
         "lignes_avoir": int((d.Type == "Avoir").sum()),
@@ -291,6 +314,30 @@ def diagnostiquer(df_source: pd.DataFrame, mapping: dict, res: Resultat) -> list
         a.append({"niveau": "info", "titre": "Lignes écartées",
                   "detail": f"{s['lignes_exclues']} lignes sur {s['lignes_source']} ne portent "
                             f"aucune quantité ou n'ont pas été retenues comme produit."})
+
+    if s.get("lignes_hors_periode"):
+        detail = (f"{s['lignes_hors_periode']} ligne(s) écartée(s) car hors de la période "
+                  f"retenue. Le rapport entier — sites, produits, mois, détail — porte "
+                  f"uniquement sur cette période.")
+        if s.get("lignes_sans_date"):
+            detail += (f" Dont {s['lignes_sans_date']} sans date exploitable, "
+                       f"impossibles à situer.")
+        a.append({"niveau": "info", "titre": "Filtre de période appliqué", "detail": detail})
+
+    # Un avoir dont la facture d'origine est hors période fausse les totaux.
+    if s["lignes_avoir"] or s["lignes_refac"]:
+        d0 = res.donnees
+        if d0["BL"].str.len().gt(2).any():
+            cles_liv = set(d0.loc[d0.Type == "Livraison", "BL"].str[2:])
+            orph = d0[(d0.Type != "Livraison") & (~d0["BL"].str[2:].isin(cles_liv))]
+            if len(orph):
+                a.append({
+                    "niveau": "alerte", "titre": "Avoirs sans facture d'origine",
+                    "detail": f"{len(orph)} avoir(s) ou refacturation(s) n'ont pas de "
+                              f"livraison correspondante dans le périmètre retenu "
+                              f"({orph['Quantite'].sum():+,.0f} unités). La facture "
+                              f"d'origine est probablement hors période : les totaux "
+                              f"s'en trouvent minorés ou majorés."})
 
     if s["lignes_avoir"]:
         ecart = s["volume"] - s["volume_livraisons"]
@@ -406,19 +453,35 @@ def par_site(res: Resultat, tri: str = "volume") -> pd.DataFrame:
     return t.sort_values("Volume", ascending=False) if tri == "volume" else t.sort_index()
 
 
+def mois_actifs(res: Resultat) -> list:
+    """Mois couverts par les données, du premier au dernier observé.
+
+    Sur un rapport filtré sur un semestre, afficher douze colonnes dont six vides
+    est du bruit : on se limite à l'intervalle réellement livré.
+    """
+    m = res.donnees.loc[res.donnees["Mois_num"] > 0, "Mois_num"]
+    if m.empty:
+        return []
+    return list(range(int(m.min()), int(m.max()) + 1))
+
+
 def par_mois(res: Resultat) -> pd.Series:
+    actifs = mois_actifs(res)
+    if not actifs:
+        return pd.Series(dtype=float)
     d = res.donnees[res.donnees["Mois_num"] > 0]
-    s = d.groupby("Mois_num")["Quantite"].sum().reindex(range(1, 13), fill_value=0)
-    s.index = MOIS
+    s = d.groupby("Mois_num")["Quantite"].sum().reindex(actifs, fill_value=0)
+    s.index = [MOIS[m - 1] for m in actifs]
     return s
 
 
 def site_mois(res: Resultat) -> pd.DataFrame:
+    actifs = mois_actifs(res)
     d = res.donnees[res.donnees["Mois_num"] > 0]
     p = d.pivot_table(index="Site", columns="Mois_num", values="Quantite",
                       aggfunc="sum", fill_value=0)
-    p = p.reindex(columns=range(1, 13), fill_value=0)
-    p.columns = MOIS
+    p = p.reindex(columns=actifs, fill_value=0)
+    p.columns = [MOIS[m - 1] for m in actifs]
     p = p.reindex(sorted(res.sites), fill_value=0)
     p["Total"] = p.sum(axis=1)
     return p
@@ -745,34 +808,38 @@ def construire_classeur(res: Resultat, client: str, periode: str, unite: str = "
     ws.page_setup.fitToWidth = 1
 
     # ------------------------------------------- 3. Volumes par site et mois
-    if res.donnees["Mois_num"].gt(0).any():
+    mois_lib = list(par_mois(res).index)
+    if mois_lib:
+        nm = len(mois_lib)
+        c_tot = 2 + nm
         ws = wb.create_sheet("Volumes par site et par mois")
         _xl_base(ws)
         _xl_titre(ws, "Volumes livrés par site et par mois",
                f"{entete}  |  En {unite}, tous produits confondus")
-        _xl_entetes(ws, 5, ["Site de livraison"] + MOIS + [f"Total ({unite})"],
-                 [32] + [10] * 12 + [13])
+        _xl_entetes(ws, 5, ["Site de livraison"] + mois_lib + [f"Total ({unite})"],
+                 [32] + [10] * nm + [13])
         r0 = 6
-        for i, s in enumerate(sites):
+        for i, s_nom in enumerate(sites):
             rr = r0 + i
-            ws.cell(row=rr, column=1, value=s)
-            for m in range(12):
-                L = get_column_letter(2 + m)
-                ws.cell(row=rr, column=2 + m,
+            ws.cell(row=rr, column=1, value=s_nom)
+            for j in range(nm):
+                L = get_column_letter(2 + j)
+                ws.cell(row=rr, column=2 + j,
                         value=f'=SUMIFS({XL_D}!${COL_QTE}:${COL_QTE},'
                               f'{XL_D}!${COL_SITE}:${COL_SITE},$A{rr},'
                               f'{XL_D}!${COL_MOIS}:${COL_MOIS},{L}$5)')
-            ws.cell(row=rr, column=14, value=f"=SUM(B{rr}:M{rr})")
+            ws.cell(row=rr, column=c_tot,
+                    value=f"=SUM(B{rr}:{get_column_letter(1 + nm)}{rr})")
         rt = r0 + ns
         ws.cell(row=rt, column=1, value="TOTAL")
-        for col in range(2, 15):
+        for col in range(2, c_tot + 1):
             L = get_column_letter(col)
             ws.cell(row=rt, column=col, value=f"=SUM({L}{r0}:{L}{rt - 1})")
-        _xl_habiller(ws, r0, rt, 14)
+        _xl_habiller(ws, r0, rt, c_tot)
         for rr in range(r0, rt + 1):
-            for col in range(2, 15):
+            for col in range(2, c_tot + 1):
                 ws.cell(row=rr, column=col).number_format = FMT_NB
-                if col == 14:
+                if col == c_tot:
                     ws.cell(row=rr, column=col).font = Font(
                         name=FONT, size=9, bold=True,
                         color=XL_FONCE if rr == rt else "000000")
@@ -935,7 +1002,11 @@ def construire_classeur(res: Resultat, client: str, periode: str, unite: str = "
          f"Énergies : {s['lignes_source']} lignes brutes."),
         ("Lignes exclues du traitement",
          f"{s['lignes_exclues']} lignes ne portant aucune quantité (références de bons de "
-         f"commande, lignes d'annulation, commentaires) ont été écartées."),
+         f"commande, lignes d'annulation, commentaires) ont été écartées."
+         + (f" {s['lignes_hors_periode']} lignes supplémentaires ont été écartées car "
+            f"hors de la période retenue : l'intégralité du présent état — sites, "
+            f"produits, mois, détail — porte sur cette seule période."
+            if s.get("lignes_hors_periode") else "")),
         ("Lignes retenues",
          f"{s['lignes_retenues']} lignes portant l'un des {npr} produits livrés : "
          + ", ".join(produits) + "."),
@@ -1056,20 +1127,25 @@ tr.tot td { background: #E8F5EF !important; font-weight: 700; color: #073D27;
 
 
 def _pdf_svg_mois(serie) -> str:
+    n = len(serie)
+    if not n:
+        return ""
+    court = [MOIS_C[MOIS.index(nom)] for nom in serie.index]
     W, H, PAD = 700, 215, 26
     mx = serie.max()
-    bw = (W - 2 * PAD) / 12
+    bw = (W - 2 * PAD) / n
     out = [f'<line x1="{PAD}" y1="{H - 30}" x2="{W - PAD}" y2="{H - 30}" stroke="#D0D4D2"/>']
+    largeur = min(bw * 0.64, 46)
     for i, v in enumerate(serie):
         h = (v / mx) * (H - 58) if mx else 0
-        x = PAD + i * bw + bw * 0.18
+        x = PAD + i * bw + (bw - largeur) / 2
         y = H - 30 - h
-        out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw * 0.64:.1f}" '
+        out.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{largeur:.1f}" '
                    f'height="{h:.1f}" rx="2" fill="{PDF_VERT}"/>')
-        out.append(f'<text x="{x + bw * 0.32:.1f}" y="{y - 5:.1f}" text-anchor="middle" '
+        out.append(f'<text x="{x + largeur / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" '
                    f'font-size="8.5" fill="{PDF_FONCE}">{_pdf_n(v / 1000, 1)}</text>')
-        out.append(f'<text x="{x + bw * 0.32:.1f}" y="{H - 14:.1f}" text-anchor="middle" '
-                   f'font-size="9" fill="#6B7280">{MOIS_C[i]}</text>')
+        out.append(f'<text x="{x + largeur / 2:.1f}" y="{H - 14:.1f}" text-anchor="middle" '
+                   f'font-size="9" fill="#6B7280">{court[i]}</text>')
     return (f'<svg viewBox="0 0 {W} {H}" width="100%" font-family="Poppins">'
             + "".join(out) + "</svg>")
 
@@ -1246,13 +1322,15 @@ def construire_rapport(res: Resultat, client: str, periode: str, unite: str = "L
     if a_mois:
         i_max = int(tm.values.argmax())
         i_min = int(tm.values.argmin())
+        nom_max = str(tm.index[i_max]).lower()
+        nom_min = str(tm.index[i_min]).lower()
         bloc_mois = f"""
 <h2 class="mt">Saisonnalité des volumes livrés</h2>
 {_pdf_svg_mois(tm)}
 <div class="note">Volumes en milliers de {unite}, tous produits et tous sites confondus.
 Volume mensuel moyen : {_pdf_n(tm.mean())} {unite}.
-Mois le plus fort : {MOIS_L[i_max]} ({_pdf_n(tm.iloc[i_max])} {unite}) ;
-mois le plus faible : {MOIS_L[i_min]} ({_pdf_n(tm.iloc[i_min])} {unite}).</div>"""
+Mois le plus fort : {nom_max} ({_pdf_n(tm.iloc[i_max])} {unite}) ;
+mois le plus faible : {nom_min} ({_pdf_n(tm.iloc[i_min])} {unite}).</div>"""
 
     # ------------------------------------------------- évolution du prix moyen
     bloc_prix = ""
@@ -1294,7 +1372,11 @@ point bas : {libelle_periode(i_lo, gr)}
         ("Source", f"Mouvements de livraison extraits du système de facturation Hympyr "
                    f"Énergies ({s['lignes_source']} lignes brutes)."),
         ("Lignes exclues", f"{s['lignes_exclues']} lignes ne portant aucune quantité "
-                           f"(références de bons de commande, annulations, commentaires)."),
+                           f"(références de bons de commande, annulations, commentaires)."
+                           + (f" {s['lignes_hors_periode']} lignes écartées car hors de la "
+                              f"période retenue : l'intégralité du présent état porte sur "
+                              f"cette seule période."
+                              if s.get("lignes_hors_periode") else "")),
         ("Lignes retenues", f"{s['lignes_retenues']} lignes portant l'un des "
                             f"{len(produits)} produits livrés : " + ", ".join(
                                 _pdf_e(p) for p in produits) + "."),
@@ -1502,20 +1584,57 @@ if not retenues:
 # 4. Options
 # =====================================================================
 st.subheader("4 · Paramètres du rapport")
-res0 = preparer(df_source, mapping, retenues)
-dmin, dmax = res0.stats["date_min"], res0.stats["date_max"]
+res_brut = preparer(df_source, mapping, retenues)
+dmin, dmax = res_brut.stats["date_min"], res_brut.stats["date_max"]
+annees = sorted(res_brut.donnees["Date"].dropna().dt.year.unique().tolist())
 
-o1, o2, o3 = st.columns([2, 2, 2])
+o1, o2 = st.columns([2, 3])
 with o1:
     client = st.text_input("Nom du client", value="", placeholder="DÉPARTEMENT DU TARN")
-with o2:
-    if pd.notna(dmin) and pd.notna(dmax):
-        defaut = f"{dmin.strftime('%d/%m/%Y')} – {dmax.strftime('%d/%m/%Y')}"
-    else:
-        defaut = str(dt.date.today().year)
-    periode = st.text_input("Période", value=defaut)
-with o3:
     unite = st.text_input("Unité des quantités", value="L")
+with o2:
+    modes = ["Toute la période du fichier", "Une année civile", "Dates personnalisées"]
+    mode = st.radio("Périmètre temporel", modes,
+                    index=1 if len(annees) > 1 else 0, horizontal=True,
+                    disabled=not annees,
+                    help="Ce filtre s'applique à l'intégralité du rapport : sites, "
+                         "produits, vue mensuelle, courbe de prix et détail des "
+                         "livraisons.")
+    debut = fin = None
+    if not annees:
+        st.caption("Aucune date exploitable : le filtre de période est indisponible.")
+    elif mode == modes[1]:
+        annee = st.selectbox("Année analysée", annees, index=len(annees) - 1)
+        debut, fin = dt.date(annee, 1, 1), dt.date(annee, 12, 31)
+    elif mode == modes[2]:
+        bornes = st.date_input("Dates analysées", value=(dmin.date(), dmax.date()),
+                               min_value=dmin.date(), max_value=dmax.date(),
+                               format="DD/MM/YYYY")
+        if isinstance(bornes, (tuple, list)) and len(bornes) == 2:
+            debut, fin = bornes
+        else:
+            st.info("Sélectionnez une date de fin pour appliquer le filtre.")
+            st.stop()
+
+if debut and fin:
+    defaut_periode = f"{debut.strftime('%d/%m/%Y')} – {fin.strftime('%d/%m/%Y')}"
+    if (debut.month, debut.day, fin.month, fin.day) == (1, 1, 12, 31) \
+            and debut.year == fin.year:
+        defaut_periode = f"Année {debut.year}"
+elif pd.notna(dmin):
+    defaut_periode = f"{dmin.strftime('%d/%m/%Y')} – {dmax.strftime('%d/%m/%Y')}"
+else:
+    defaut_periode = str(dt.date.today().year)
+periode = st.text_input("Intitulé de la période affiché sur les documents",
+                        value=defaut_periode)
+
+res0 = preparer(df_source, mapping, retenues, debut=debut, fin=fin)
+if not len(res0.donnees):
+    st.error("Aucune livraison sur la période retenue. Élargissez le périmètre.")
+    st.stop()
+if res0.stats["lignes_hors_periode"]:
+    st.caption(f"Filtre actif : {res0.stats['lignes_hors_periode']} ligne(s) écartée(s) "
+               f"hors période, {res0.stats['lignes_retenues']} conservée(s).")
 
 with st.expander("Regrouper ou renommer les sites et les produits"):
     st.caption("Modifiez la colonne « Libellé retenu » pour corriger un libellé ou fusionner "
@@ -1578,35 +1697,23 @@ with st.expander("Valorisation financière (optionnelle)"):
                 "Ajouter la courbe d'évolution du prix moyen", value=True,
                 help="Une page supplémentaire dans le PDF et un onglet dans le classeur.")
             if prix_options["actif"]:
+                prix_options["debut"] = prix_options["fin"] = None
                 q1, q2 = st.columns([1, 2])
                 with q1:
                     prix_options["granularite"] = st.radio(
                         "Granularité", ["Mois", "Trimestre", "Semaine"], index=0)
-                    tout = st.checkbox("Toute la période du document", value=True)
                 with q2:
-                    d0, d1 = res0.stats["date_min"], res0.stats["date_max"]
-                    if tout or pd.isna(d0):
-                        prix_options["debut"] = prix_options["fin"] = None
-                        if pd.notna(d0):
-                            st.caption(f"Période retenue : du {d0.strftime('%d/%m/%Y')} "
-                                       f"au {d1.strftime('%d/%m/%Y')}.")
-                    else:
-                        bornes = st.date_input(
-                            "Période analysée", value=(d0.date(), d1.date()),
-                            min_value=d0.date(), max_value=d1.date())
-                        if isinstance(bornes, (tuple, list)) and len(bornes) == 2:
-                            prix_options["debut"], prix_options["fin"] = bornes
-                        else:
-                            prix_options["debut"] = prix_options["fin"] = None
                     prix_options["produits"] = st.multiselect(
                         "Produits analysés",
                         [renommage.get(p, p) for p in res0.produits], default=[],
                         help="Vide = tous les produits. Restreindre à un seul produit "
                              "donne une courbe lisible ; mélanger plusieurs énergies fait "
                              "surtout apparaître un effet de mix, pas un effet prix.")
+                    st.caption("La courbe couvre le périmètre temporel défini à l'étape 4, "
+                               "comme le reste du rapport.")
 
 res = preparer(df_source, mapping, retenues, regroupement, renommage,
-                       col_prix, diviseur)
+                       col_prix, diviseur, debut, fin)
 
 # =====================================================================
 # 5. Contrôles
